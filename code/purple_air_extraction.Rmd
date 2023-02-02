@@ -1,6 +1,6 @@
 ---
 title: "purple_air"
-author: "Emma Rieves & Zac Clement"
+author: "Emma Rieves"
 date: "2/2/2022"
 output: html_document
 ---
@@ -116,8 +116,8 @@ For the next chunk of code to run, if on a Windows machine you **must** do the f
 
 # for windows machines only
 # the following line will create a local 4-node snow cluster
-workers = makeCluster(4, type="SOCK", outfile="Log.txt")
-registerDoParallel(workers)
+#workers = makeCluster(4, type="SOCK", outfile="Log.txt")
+#registerDoParallel(workers)
 
 purpleairDownload(site.csv = fire_area_sensors, start.date = "2021-12-30", end.date = "2022-05-01", output.path = "../fire_counties_PAs/", average = 10, time.zone = "America/Denver", indoor = TRUE, n.thread = 1)
 ```

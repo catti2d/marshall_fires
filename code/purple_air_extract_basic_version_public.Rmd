@@ -1,0 +1,136 @@
+---
+title: "purple_air"
+author: "Emma Rieves"
+date: "1/27/23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(tidyverse)
+library(readr)
+library(plyr)
+library(sf)
+
+# PM2.5 package recommended by Priyanka
+# devtools::install_github("jianzhaobi/bjzresc")
+# https://github.com/jianzhaobi/bjzresc
+library(bjzresc)
+
+# to make the spherical geometry errors go away
+sf::sf_use_s2(FALSE)
+```
+
+# Import municipal boundary data
+Import the shapefiles that were downloaded from the different city GIS portals. All of this data is stored in the `/GIS_inputs_destruction_fireboundary/` directory.
+```{r}
+## Use boulder county shapefile to extract municipal boundaries for Boulder counties
+BO_CO = st_read("../GIS_inputs_destruction_fireboundary/Boulder_county_munis/Municipalities.shp")
+
+## All of the areas surrounding the fire in shapefiles:
+boulder_precincts = st_read("../GIS_inputs_destruction_fireboundary/Unincorporated_Boulder/Unincorporated_Boulder.shp")
+# Broomfield, has to be transformed to match the CRS of the Boulder data
+broomfield_precincts = st_read("../GIS_inputs_destruction_fireboundary/Broomfield_Precincts/Precincts.shp") %>%
+  st_transform(st_crs(boulder_precincts))
+# Westminster, has to be transformed to match the CRS of the Boulder data
+westminster_city = st_read("../GIS_inputs_destruction_fireboundary/Westminster_CityLimits/CityLimits.shp") %>%
+  st_transform(st_crs(boulder_precincts))
+
+# combine all of the Boulder, Broomfield, and Westminster shape data with a union
+surrounding_area = st_union(st_combine(boulder_precincts), st_combine(broomfield_precincts)) %>%
+  st_union(westminster_city) %>%
+  st_combine(.)
+
+# Create an object of all of the places the fire reached from the BO_CO object
+# This is needed to get the CRS from
+fire_counties = BO_CO %>%
+    filter(ZONEDESC == "Louisville" |
+             ZONEDESC == "Superior" |
+             ZONEDESC == "Broomfield" |
+             ZONEDESC == "Lafayette" |
+             ZONEDESC == "Boulder")
+
+prg = raster::crs(fire_counties,asText=TRUE)
+
+```
+
+# Download AQ data 
+We are using the `bjzresc` package to download the Purple Air sensor data for the region we created above.
+
+This function will get a list of current Purple Air sensors & their locations. We then intersect this list with the municipal boundary geometry we created to get a list of all the sensors within our area of interest. These sensors all have an ID associated with them, which we will then use to download the data for the time period we want.
+```{r}
+## use bjzresc package to get list of purple air sensors; save to df instead of csv
+pa_download = getPurpleairLst(output.path = NULL)
+```
+
+Here we are intersecting the sensor list with our geometry to find sensors within the fire area.
+```{r}
+## Intersect municipal boundaries with PA sensors
+
+# remove null Lat/Long PA sensors -- important to creating spatial dataframe
+pa_download = pa_download[complete.cases(pa_download[c("Lat","Lon")]),]
+
+# check that it worked
+sum(is.na(pa_download[c("Lat", "Lon")]))
+
+# create spatial dataframe, set CRS to match muni boundaries
+pa_download_spatial = pa_download %>% 
+  st_as_sf(coords = c("Lon", "Lat")) %>% 
+  st_set_crs(prg)
+
+# check CRS
+raster::crs(pa_download_spatial)
+
+# intersect PA download area and fire affected area to download sensors
+fire_affected_sensors = st_intersection(pa_download_spatial, st_buffer(surrounding_area, 0))
+
+# get sensor IDs for sensors in fire affected area
+fire_area_sensor_IDs = fire_affected_sensors$ID
+
+# filter original dataframe to include only sensors in fire affected area
+(fire_area_sensors = pa_download[pa_download$ID %in% fire_area_sensor_IDs, ])
+```
+
+For the next chunk of code to run, if on a Windows machine you **must** do the following:
+1. In the console, run `trace("purpleairDownload", edit=TRUE)`
+2. A window will pop up with the source code for the download function
+```{r eval=F}
+# download purple air data -- TAKES A LONG TIME TO RUN SO BE READY FOR THAT
+## output path is a folder that stores a csv for each sensor for the target time period
+## average means that data is averaged for 10-minute intervals
+## indoor = TRUE includes indoor sensor observations
+
+# for windows machines only
+# the following line will create a local 4-node snow cluster
+#workers = makeCluster(4, type="SOCK", outfile="Log.txt")
+#registerDoParallel(workers)
+
+purpleairDownload(site.csv = fire_area_sensors, start.date = "2021-12-30", end.date = "2022-05-01", output.path = "../fire_counties_PAs/", average = 10, time.zone = "America/Denver", indoor = TRUE, n.thread = 1)
+```
+
+```{r}
+# download purple air data (with above specifications) for the Marshall fire boundary
+#purpleairDownload(site.csv = fire_area_sensors2, start.date = "2021-12-30", end.date = "2022-05-01", output.path = "marshall_fire_path_PAs/", average = 10, time.zone = "America/Denver", indoor = TRUE, n.thread = 1)
+```
+
+
+# Combine data into single dataframe
+```{r}
+## Read downloaded PA files from their filepath and turn them into a DF
+
+# directory where files are stored
+dir = "../fire_counties_PAs/"
+
+# create a list of all file names in this directory
+file_name = list.files(path=dir, pattern="*.csv", full.names=TRUE)
+
+# read csvs for each filename in list --> results in a list of lists
+AQ_files = lapply(file_name, read_csv)
+
+# combine all AQ lists from each directory into AQ dataframe 
+(AQ_df = rbind.fill(AQ_files) %>% as.data.frame())
+```

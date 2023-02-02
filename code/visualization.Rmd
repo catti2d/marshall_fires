@@ -1,7 +1,7 @@
 ---
 title: "marshall_visualizations"
 author: "Emma Rieves & Zac Clement"
-date: "Created 4/27/2022, Updated 7/5/2022"
+date: "Created 4/27/2022, Updated 7/5/2022, Updated ESR 12/1/22"
 output: html_document
 editor_options: 
   markdown: 
@@ -15,6 +15,7 @@ knitr::opts_chunk$set(echo = TRUE)
 # Load the Libraries
 ```{r}
 library(sf)
+library(dplyr)
 library(sp)
 library(gstat)
 library(raster)
@@ -60,24 +61,27 @@ broomfield_precincts = st_read("../GIS_inputs_destruction_fireboundary/Broomfiel
 # Westminster Boundary
 westminster_city = st_read("../GIS_inputs_destruction_fireboundary/Westminster_CityLimits/CityLimits.shp")
 
+# prg - set projection for everything
+prg = "+proj=utm +zone=13 +datum=WGS84 +units=km +no_defs"
+
 # make all the precincts have the same columns (we don't need a lot of the data)
 boulder_precincts <- boulder_precincts %>%
-  select(c(OBJECTID, geometry, SHAPEarea, SHAPElen))
+  dplyr::select(c(OBJECTID, geometry, SHAPEarea, SHAPElen))
 broomfield_precincts <- broomfield_precincts %>%
   mutate(SHAPEarea = Shape__Are,
          SHAPElen = Shape__Len,
          OBJECTID = OBJECTID + 1000) %>% # add 1,000 to the broomfield precincts to get rid of overlapping labels
-  select(-c("GlobalID", "GIS_ID", "PRECINCT_N", "MAP_COLOR", "USER_COMME", "LAST_UPDAT", "Shape__Are", "Shape__Len"))
+  dplyr::select(-c("GlobalID", "GIS_ID", "PRECINCT_N", "MAP_COLOR", "USER_COMME", "LAST_UPDAT", "Shape__Are", "Shape__Len"))
 westminster_city <- westminster_city %>%
   mutate(SHAPEarea = ShapeSTAre,
          SHAPElen = ShapeSTLen) %>%
-  select(c(OBJECTID, geometry, SHAPEarea, SHAPElen))
+  dplyr::select(c(OBJECTID, geometry, SHAPEarea, SHAPElen))
 
 # save proj string for fire-affected counties to use for other transformations
-prg = raster::crs(fire_counties,asText=TRUE)
+#prg = raster::crs(fire_counties,asText=TRUE)
 
 # all boundaries joined together
-all_bounds <- boulder_precincts %>%
+all_bounds <- st_transform(boulder_precincts, crs = prg) %>%
   rbind(st_transform(broomfield_precincts, crs=prg)) %>%
   rbind(st_transform(westminster_city, crs=prg))
 
@@ -240,20 +244,111 @@ timeSensorIcon = awesomeIconList(
               values = ~sensors$Status, title = "Sensor Time Info"))
 ```
 
+# Making grid for interpolation
+We create a 50x50 grid for interpolation. This results in the resolution being 0.009372036 km wide by 0.007888942 km tall.
+```{r}
+grd <- SpatialPixels(SpatialPoints(as_Spatial(st_make_grid(all_bounds, n=50))), proj4string = prg)
+plot(grd)
 
-## Create spatial objects
+grd <- grd[as_Spatial(all_bounds),]
+plot(grd)
+
+grd <- spTransform(grd, CRS(prg))
+
+
+r_grd <- raster(grd, nrows=50, ncols=49) # creating a 50x50 object gives some weird visuals
+```
+
+# Create spatial objects
 To do more in-depth spatial analysis and mapping, we need to convert our data into spacetime objects.
 ```{r}
-## Create spacetime objects -- 10 minute averages
+library(lubridate)
+# Cleaning to prepare to make spatial objects
 # first, re-format datetime as a xts object
 AQ_df$datetime = as.POSIXct(AQ_df$datetime)
 
+# filter out extreme values from Eisenhower dr PA sensor
+AQ_df%>% filter(ID == 91877 & corrected_pm > 1000) # 319 over 1000
+AQ_df[AQ_df$ID == 91877 & AQ_df$corrected_pm > 1000, ] = NA
+AQ_df %>% filter(ID == 91877 & corrected_pm > 1000) # 0 obs over 1000
+
+# use floor date (lubridate) to effectively resample into daily posixct object, then calculate daily average for each ID
+daily_AQ_df = AQ_df %>% mutate(day = floor_date(datetime, "day")) %>% group_by(ID,day) %>% summarise(daily_mean = mean(corrected_pm)) # 1622 distinct rows
+
+# create dataframe of sensor data to merge with daily data
+sensor_data_df = AQ_df %>% dplyr::select(ID, Name, Lon, Lat, Location)
+sensor_data_df = sensor_data_df %>% na.omit() %>% distinct() # 53 distinct sensors (one row of NAs)
+
+# merge daily AQ df and sensor data df, distinct removes any duplicates that would arise
+AQ_data = merge(sensor_data_df,daily_AQ_df,by="ID") # should be 1621 rows
+AQ_data 
+
+# check for NAs -- not all sensors have all data, 42 sensors that don't have data (but more that are just excluded in the index)
+sapply(AQ_data, function(x) sum(is.na(x)))
+
+```
+
+```{r}
+# cleaning -- remove wonky sensors
+AQ_data = AQ_data %>%
+  # already filtered out Eisenhower Dr outliers (PM > 1000) above before aggregation
+  # exclude any non-outside sensors
+  filter(Location == "outside") %>%
+  # drop sensor 112606 (Wildwood Ct) because it has 0% confidence according to PurpleAir map (per Zac)
+  filter(ID != 112606)
+
+# determine the number of sensors for days < Feb 4 -- looks like there are 48 overall with 30 sensors during various phases of the time period (1/8 - 2/4)
+AQ_data %>% group_by(ID) %>% summarise(count = n())
+AQ_data %>% group_by(ID) %>% filter(day < "2022-02-05") %>% summarise(count = n())
+
+```
+
+
+```{r}
+# THIS SECTION DETERMINES: which sensors have enough data within the study period (1/8 - 2/5) to be used to create the study period average used in IDW.
+
+# determine which IDs have enough data within the study period to be used to create the monthly average variable
+study_completeness = AQ_data %>% 
+  # filter to include only study period
+  filter(day >= "2022-01-08" & day < "2022-02-05") %>% 
+  group_by(ID) %>%
+  # create completeness variable, need 70% of days in period to be complete
+  # 28 days in study period, use this to determine complete pct
+  summarise(day_count = n(),
+            complete_pct = (day_count/28) * 100,
+            is_complete = ifelse(complete_pct >= 70, "complete", "incomplete")) # 8 sensors are complete
+
+# merge with completeness variable with AQ_data to create AQ_data_study_period
+(AQ_data_study_period = merge(study_completeness %>% dplyr::select(ID,is_complete),AQ_data, by = "ID")) # only 1174 rows, probably because of removed dates
+
+# these seem really low...
+AQ_data_study_period = AQ_data_study_period %>% 
+  # filter to include only the study period
+  filter(day >= "2022-01-08" & day < "2022-02-05") %>% 
+  # filter to only include complete sensors
+  filter(is_complete == "complete") %>%
+  # groupby ID to calculate the "study mean" -- the mean over the study time period
+  group_by(ID) %>% 
+  summarise(study_mean = mean(daily_mean),
+            Lat = Lat,
+            Lon = Lon) %>%
+  # keep distinct observations
+  distinct()
+
+
+AQ_data_study_period
+# to gut check
+AQ_data %>% filter(ID == 65669)
+```
+
+
+```{r}
 # create spatial points object for each sensor
-PA_sensors = SpatialPoints(AQ_df[!duplicated(AQ_df$ID), c("Lon", "Lat")],proj4string = CRS(prg))
-summary(PA_sensors)
+PA_sensors = SpatialPoints(AQ_data[!duplicated(AQ_data$ID), c("Lon", "Lat")],proj4string = CRS(prg))
+summary(PA_sensors) # 48 sensors
 
 # construct spatiotemporal object
-PA_STFDF = stConstruct(AQ_df, space = c("Lon","Lat"), time = "datetime", crs = CRS(prg), SpatialObj = sensors)
+PA_STFDF = stConstruct(AQ_data, space = c("Lon","Lat"), time = "day", crs = CRS(prg), SpatialObj = PA_sensors)
 
 # turn ST object into a STFDF (stationary points)
 PA_STFDF = as(PA_STFDF,"STFDF")
@@ -266,6 +361,226 @@ class(PA_STFDF)
 dim(PA_STFDF)
 ```
 
+# Descriptive plots
+```{r}
+# not all sensors have complete data
+study_period = AQ_data %>% 
+  # filter to correct dates
+  filter(day >= "2022-01-08" & day < "2022-02-05") %>%
+  # no data for this sensor
+  filter(ID != 119691)
+
+# max value during the time period
+max(study_period$daily_mean, na.rm = TRUE)
+
+# create plot -- png makes blurry I recommend screenshot
+#png("../images/manuscript/time_series.png",width = 850, height = 600)
+print(ggplot(data = study_period, aes(x = day, y = daily_mean)) +
+  geom_line() +
+  facet_wrap(~ID) +
+  labs(y = expression("Daily average PM"[2.5]*" (µg/m"^3*")"), x = "Date",
+       title = expression("Time series of daily average PM"[2.5]*" for each sensor from January 8 to February 4, 2022")))
+#dev.off()
+```
+
+```{r}
+#make id a char for grouping
+study_period$ID = as.character(study_period$ID)
+print(ggplot(data = study_period, aes(x = day, y = daily_mean, color=ID)) +
+  geom_line() +
+  labs(y = expression("Daily average PM"[2.5]*" (µg/m"^3*")"), x = "Date",
+       title = expression("Time series of daily average PM"[2.5]*" for each sensor from January 8 to February 4, 2022")))
+```
+
+```{r}
+# create figure asked for by Joost and Jon
+study_period2 = AQ_data %>% 
+  # filter to correct dates
+  filter(day < "2022-02-05") %>%
+  # no data for this sensor
+  filter(ID != 119691)
+
+#make id a char for grouping
+study_period2$ID = as.character(study_period2$ID)
+print(ggplot(data = study_period2, aes(x = day, y = daily_mean, color=ID)) +
+  geom_line() +
+  labs(y = expression("Daily average PM"[2.5]*" (µg/m"^3*")"), x = "Date",
+       title = expression("Purple Air daily average PM"[2.5]*"")))
+```
+
+
+
+# IDW
+## daily plots
+```{r}
+# determine AQ max and min values to create upper and lower bounds for mapping -- use PAstfdf so mapping is consistent across all maps
+(aq_max = max(PA_STFDF[,"2022-01-01::2022-02-04"]@data$daily_mean, na.rm = TRUE)) # 172.2092
+(aq_min = min(PA_STFDF[,"2022-01-01::2022-02-04"]@data$daily_mean, na.rm = TRUE)) # 0.12695
+
+summary(PA_STFDF[,"2022-01-08::2022-02-04"])
+
+# create equal interval breaks based on aq min and max
+(breaks2 = seq(from=aq_min, to=aq_max, length.out = 6))
+
+# helper function to plot
+plot_idw_raster_daily <- function(idw, title) {
+  r <- raster::rasterize(idw, r_grd, field="var1.pred")
+  extent(r) <- st_bbox(all_bounds)
+  r_df <- r %>%
+    rasterToPoints() %>%
+    data.frame() %>%
+    mutate(cuts = cut(layer, breaks=breaks2, na.omit=T))
+  
+  return(ggplot() +
+          geom_tile(data=r_df, aes(x=x, y=y, fill=cuts))+
+          scale_fill_brewer(palette = "YlOrRd", name=expression("PM"[2.5]*" (µg/m"^3*")"), drop=FALSE) +
+          geom_sf(data=marshall_fire$geometry, col="gray20", alpha=0.1) +
+          geom_point(data = r_df[!is.na(r_df$daily_mean), ], aes(x = x, y = y)) + 
+          labs(y = "Latitude", x = "Longitude",
+               caption = "Border represents Marshall Fire perimeter") +
+          ggtitle(title))
+}
+
+```
+
+```{r}
+# jan 1 - feb 4th inclusive
+for (j in 1:2) {
+  date <- paste("2022-0", j, sep="")
+  if (j == 1) {
+    range = 1:31
+  } else {
+    range = 1:4
+  }
+  
+  for (i in range) {
+    if (i < 10) {
+      i <- paste("0", i, sep="")
+    }
+    day1 <- paste(date, "-", i, sep="")
+    #print(day1)
+    daily_data <- PA_STFDF[, day1]
+    print(daily_data@data)
+    #print(data@data)
+    N = n_distinct(daily_data@data$ID)
+    
+    idw <- idw(daily_mean~1, daily_data[!is.na(daily_data$daily_mean),], grd, idp = 3)
+    #idw <- idw(daily_mean~1, data, grd, idp = 3)
+    #png(paste("../images/jan1-feb4_V2/", day1, ".png", sep=''))
+    print(plot_idw_raster_daily(idw, paste(day1, "IDW, N = ", N)))
+    #dev.off()
+    }
+}
+```
+
+## average plot
+```{r}
+(monthly_avg_data = AQ_data %>% 
+  filter(day >= "2022-01-08" & day < "2022-02-05") %>% 
+  group_by(ID) %>% 
+  # use 28 in calculating the percent because 28 days in the period
+  dplyr::summarise(N = n(),
+                   # include Lat and Lon to reduce need for joins
+                   Lat = Lat,
+                   Lon = Lon,
+                   pct_complete = (N/28) * 100,
+                   is_usable = ifelse(pct_complete >= 70, "usable", "not usable"),
+                   mean_pm = mean(daily_mean, na.rm=TRUE)))
+
+(monthly_avg_data = monthly_avg_data %>% filter(is_usable == "usable") %>% distinct() %>% as.data.frame())
+row.names(monthly_avg_data) = monthly_avg_data$ID
+```
+
+```{r}
+# make spatial object of monthly average
+# start by creating spatial stations
+coords = cbind(monthly_avg_data$Lon, monthly_avg_data$Lat)
+row.names(coords) = monthly_avg_data$ID
+
+# create spatial data frame of points
+(monthly_avg_data_spatial = SpatialPointsDataFrame(coords, monthly_avg_data, proj4string = CRS(prg), match.ID = TRUE))
+monthly_avg_data_spatial@data
+```
+
+```{r}
+monthly_idw = idw(mean_pm~1, monthly_avg_data_spatial, grd, idp = 2)
+
+#png("../images/manuscript/period_average.png", width = 700, height = 350)
+tiff("../images/manuscript/period_average.tiff", units = "in", width = 12, height = 3.5, res = 600)
+(monthly_idw_fig = plot_idw_raster_daily(idw = monthly_idw, title = expression("Inverse distance weighted interpolated PM"[2.5]*" concentrations averaged from January 8 to February 4, 2022, N = 9")))
+dev.off()
+
+```
+
+```{r}
+## USE THIS TO PRINT MANUSCRIPT GRAPHIC
+r1 = raster::rasterize(monthly_idw, r_grd, field="var1.pred")
+extent(r1) = st_bbox(all_bounds)
+r_df1 = r1 %>%
+  rasterToPoints() %>%
+  data.frame() %>%
+  mutate(cuts = cut(layer, breaks2, na.omit=T))
+
+monthly_plot = ggplot() +
+  geom_tile(data=r_df1, aes(x=x, y=y, fill=cuts))+
+  scale_fill_brewer(palette = "YlOrRd", name=expression("PM"[2.5]*" (µg/m"^3*")"), drop=FALSE) +
+  geom_sf(data=marshall_fire$geometry, col="gray20", alpha=0.1) +
+  geom_point(data = r_df1[!is.na(r_df1$daily_mean), ], aes(x = x, y = y)) + 
+  #ggtitle("Inverse distance weighted interpolated PM"[2.5]*" concentrations averaged from January 8 to February 4, 2022, N = 9") +
+  labs(title = expression("IDW interpolated PM"[2.5]*" concentration, averaged from 1/8/22 - 2/4/22, N = 9"), y = "Latitude", x = "Longitude", caption = "Border represents Marshall Fire perimeter")
+
+
+tiff("../images/manuscript/period_average.tiff", units = "in", width = 10, height = 3.5, res = 600)
+monthly_plot
+dev.off()
+```
+
+
+```{r}
+sensors_in_monthly_avg = study_period %>%
+  filter(ID %in% c("65669","68375","81149","85999","86477","91877","92321","136514","137686"))
+
+write.csv(sensors_in_monthly_avg,"../intermediary_outputs/sensors_in_monthly_data.csv")
+
+print(ggplot(data = sensors_in_monthly_avg, aes(x = day, y = daily_mean)) +
+  geom_line() +
+  facet_wrap(~ID) +
+  labs(y = expression("Daily average PM"[2.5]*" (µg/m"^3*")"), x = "Date",
+       title = expression("Time series of daily average PM"[2.5]*" for sensors used to create average from January 8 to February 4, 2022")))
+```
+
+```{r}
+#make ID a char for goruping in fig
+sensors_in_monthly_avg$ID = as.character(sensors_in_monthly_avg$ID)
+print(ggplot(data = sensors_in_monthly_avg, aes(x = day, y = daily_mean, color=ID)) +
+  geom_line() +
+  labs(y = expression("Daily average PM"[2.5]*" (µg/m"^3*")"), x = "Date",
+       title = expression("Time series of daily average PM"[2.5]*" for sensors used to create average from January 8 to February 4, 2022")))
+```
+
+```{r}
+# using the weird numbers to confirm that this works without corrupting original version.. go back and change everything to this if need be
+allbounds3 = all_bounds
+allbounds3 = st_transform(allbounds3, crs=4326)
+marshall2 = marshall_fire
+marshall2 = st_transform(marshall2, crs = 4326)
+
+(basemap = ggplot() +
+  geom_sf(data = allbounds3) +
+  geom_sf(data = marshall2))
+
+basemap +
+  geom_point(
+    data = monthly_avg_data,
+    aes(x=Lon,y=Lat,color=mean_pm)
+  )
+```
+
+
+
+
+
+# PAST WORK
 # Map of all sensors we have data for (many not online during the fire)
 ```{r}
 ggplot(all_bounds, aes(geometry=geometry)) +
@@ -308,19 +623,19 @@ stplot(complete_STFDF[,"2021-12-30::2021-12-31","corrected_pm"], mode="tp")
 After running through this kriging methodology without removing any data points, there were a few sensors that had very strange values when looking through the variograms. This prompted me to plot them individually and examine the actual PM2.5 values for the fire period, to see if any of them seemed unreasonable. Both the Eisenhower Dr and 1333 Wildwood Ct sensors have values that are far too high, so those are dropped for our analysis done below.
 ```{r}
 # Index 15 -> ID 60517, STANDLEY LAKE
-plot(fortify(PA_STFDF[PA_STFDF@data$ID == 60517]["2021-12-30::2022-01-02", "corrected_pm"]))
+#plot(fortify(PA_STFDF[PA_STFDF@data$ID == 60517]["2021-12-30::2022-01-02", "corrected_pm"]))
 # looks normal
 
 # Index 23 -> ID 91877, Eisenhower Dr
-plot(fortify(PA_STFDF[PA_STFDF@data$ID == 91877]["2021-12-30::2022-01-02", "corrected_pm"]))
+#plot(fortify(PA_STFDF[PA_STFDF@data$ID == 91877]["2021-12-30::2022-01-02", "corrected_pm"]))
 # has incredibly large values midday Friday - Sunday, could be snow related?
 
 # Index 36 -> ID 112606, 1333 Wildwood Ct., Boulder, CO 80305 sensor
-plot(fortify(PA_STFDF[PA_STFDF@data$ID == 112606]["2021-12-30::2022-01-02", "corrected_pm"]))
+#plot(fortify(PA_STFDF[PA_STFDF@data$ID == 112606]["2021-12-30::2022-01-02", "corrected_pm"]))
 # looking at purpleair map, A channel is 'downgraded', 0% confidence
 
 # Index 40 -> ID 119547, Broadlands sensor
-plot(fortify(PA_STFDF[PA_STFDF@data$ID == 119547]["2021-12-30::2022-01-02", "corrected_pm"]))
+#(fortify(PA_STFDF[PA_STFDF@data$ID == 119547]["2021-12-30::2022-01-02", "corrected_pm"]))
 # reasonable values
 ```
 
@@ -337,11 +652,13 @@ krig_data <- krig_data[krig_data@data$ID != 112606]
 krig_data@data[(krig_data@data$ID == 91877) &
                  (as.numeric(krig_data@data$corrected_pm) > 1000) &
                  !is.na(krig_data@data$corrected_pm),]$corrected_pm <- NA
-# get rid of the weird sensor that might be throwing residuals off
-krig_data <- krig_data[krig_data@data$Name != "ntsky"]
+
+# get rid of the weird sensor that might be throwing residuals off -- COMMENTED OUT FOR KRIG-DATA TO WORK
+#krig_data <- krig_data[krig_data@data$Name != "ntsky"]
 
 # reproject the data to utm
 reproj <- "+proj=utm +zone=13 +datum=WGS84 +units=km"
+#krig_data@sp <- spTransform(krig_data@sp, reproj)
 krig_data@sp <- spTransform(krig_data@sp, reproj)
 
 # aggregate from 10 min intervals to 1 hour intervals
@@ -379,22 +696,23 @@ january2.vgm <- variogram(corrected_pm~1, january2[!is.na(january2$corrected_pm)
 
 # plot the variograms
 plot(pre_fire.vgm)
-plot(during_fire.vgm)
+# plot(during_fire.vgm) -- ERROR: need finite 'xlim' values
 plot(evening_of_fire.vgm)
-plot(december31.vgm)
-plot(january1.vgm)
-plot(january2.vgm)
+# plot(december31.vgm)  -- ERROR: need finite 'xlim' values
+# plot(january1.vgm) -- ERROR: need finite 'xlim' values
+# plot(january2.vgm) -- ERROR: need finite 'xlim' values
 ```
 
 
 ### Variogram Clouds
 ```{r}
-for (period in periods) {
-  cloud <- variogram(corrected_pm~1, period[!is.na(period$corrected_pm), ], cloud=TRUE)
-  map <- variogram(corrected_pm~1, period[!is.na(period$corrected_pm), ], map=TRUE, cutoff=20, width=2)
-  print(plot(cloud))
-  print(plot(map))
-}
+# ERROR -- "error in evaluating the argument 'x' in selecting a method for function 'print': need finite 'xlim' values"
+# for (period in periods) {
+#   cloud <- variogram(corrected_pm~1, period[!is.na(period$corrected_pm), ], cloud=TRUE)
+#   map <- variogram(corrected_pm~1, period[!is.na(period$corrected_pm), ], map=TRUE, cutoff=20, width=2)
+#   print(plot(cloud))
+#   print(plot(map))
+# }
 
 ```
 
@@ -409,30 +727,30 @@ pre_fire.fitted
 
 plot(pre_fire.vgm, model=pre_fire.fitted)
 
-during_fire.fitted <- fit.variogram(during_fire.vgm, vgm(c("Exp", "Sph", "Gau", "Mat")))
-during_fire.fitted
+#during_fire.fitted <- fit.variogram(during_fire.vgm, vgm(c("Exp", "Sph", "Gau", "Mat"))) -- ERROR: "object should be of class gstatVariogram or variogramCloud"
+#during_fire.fitted
 
-plot(during_fire.vgm, model=during_fire.fitted)
+#plot(during_fire.vgm, model=during_fire.fitted)
 
 evening_of_fire.fitted <- fit.variogram(evening_of_fire.vgm, vgm(c("Exp", "Sph", "Gau", "Mat")))
 evening_of_fire.fitted
 
 plot(evening_of_fire.vgm, model=evening_of_fire.fitted)
 
-december31.fitted <- fit.variogram(december31.vgm, vgm(c("Exp", "Sph", "Gau", "Mat")))
-december31.fitted
+# december31.fitted <- fit.variogram(december31.vgm, vgm(c("Exp", "Sph", "Gau", "Mat"))) -- ERROR: "object should be of class gstatVariogram or variogramCloud"
+# december31.fitted
+# 
+# plot(december31.vgm, model=december31.fitted)
 
-plot(december31.vgm, model=december31.fitted)
+# january1.fitted <- fit.variogram(january1.vgm, vgm(c("Exp", "Sph", "Gau", "Mat"))) -- ERROR: "object should be of class gstatVariogram or variogramCloud"
+# january1.fitted
+# 
+# plot(january1.vgm, model=january1.fitted)
 
-january1.fitted <- fit.variogram(january1.vgm, vgm(c("Exp", "Sph", "Gau", "Mat")))
-january1.fitted
-
-plot(january1.vgm, model=january1.fitted)
-
-january2.fitted <- fit.variogram(january2.vgm, vgm(c("Exp", "Sph", "Gau", "Mat")))
-january2.fitted
-
-plot(january1.vgm, model=january2.fitted)
+# january2.fitted <- fit.variogram(january2.vgm, vgm(c("Exp", "Sph", "Gau", "Mat"))) -- ERROR: "object should be of class gstatVariogram or variogramCloud"
+# january2.fitted
+# 
+# plot(january1.vgm, model=january2.fitted)
 ```
 
 These models are no good (some can't even find models), so kriging isn't going to be working with this data.
@@ -500,7 +818,7 @@ january1.idw <- idw(corrected_pm~1, january1[!is.na(january1$corrected_pm),], gr
 spplot(january1.idw[,1], main="January 1st")
 
 january2.idw <- idw(corrected_pm~1, january2[!is.na(january2$corrected_pm),], grd)
-spplot(january2.idw[,1], main="January 2nd")
+# spplot(january2.idw[,1], main="January 2nd") -- ERROR: "'breaks' are not unique"
 ```
 
 Let's make the maps easier to read. We use the EPA AQI mapping standards for these and create plots that have consistent legends.
@@ -560,12 +878,12 @@ plot_idw_raster <- function(idw, title) {
           ggtitle(title))
 }
 
-plot_idw_raster(pre_fire.idw, "Pre Fire IDW")
-plot_idw_raster(during_fire.idw, "During Fire IDW")
-plot_idw_raster(evening_of_fire.idw, "Evening of fire IDW")
-plot_idw_raster(december31.idw, "December 31st IDW")
-plot_idw_raster(january1.idw, "January 1st IDW")
-plot_idw_raster(january2.idw, "January 2nd IDW")
+# plot_idw_raster(pre_fire.idw, "Pre Fire IDW")
+# plot_idw_raster(during_fire.idw, "During Fire IDW")
+# plot_idw_raster(evening_of_fire.idw, "Evening of fire IDW")
+# plot_idw_raster(december31.idw, "December 31st IDW")
+# plot_idw_raster(january1.idw, "January 1st IDW")
+# plot_idw_raster(january2.idw, "January 2nd IDW")
 ```
 
 ### Export smoke affected area
@@ -610,11 +928,11 @@ paste("January 1 standard deviation:", january1.idw_sd)
 spplot(january1.idw_cv, main="January 1st")
 january1.idw_cv$zscore <- january1.idw_cv$residual / january1.idw_sd
 
-january2.idw_cv <- krige.cv(corrected_pm~1, january2[!is.na(january2$corrected_pm),], nfold=38)
-january2.idw_sd <- sd(january2.idw_cv$residual)
-paste("January 2 standard deviation:", january2.idw_sd)
-spplot(january1.idw_cv, main="January 2nd")
-january2.idw_cv$zscore <- january2.idw_cv$residual / january2.idw_sd
+#january2.idw_cv <- krige.cv(corrected_pm~1, january2[!is.na(january2$corrected_pm),], nfold=38) -- ERROR: "must have 'max' > 'min'"
+# january2.idw_sd <- sd(january2.idw_cv$residual)
+# paste("January 2 standard deviation:", january2.idw_sd)
+# spplot(january1.idw_cv, main="January 2nd")
+# january2.idw_cv$zscore <- january2.idw_cv$residual / january2.idw_sd
 ```
 
 Plotting these residuals & normalizing them to z-scores for easier visual comparison.
@@ -642,14 +960,14 @@ plot_idw_resid(during_fire.idw_cv, "During Fire Residuals")
 plot_idw_resid(evening_of_fire.idw_cv, "After Fire Residuals")
 plot_idw_resid(december31.idw_cv, "December 31st Residuals")
 plot_idw_resid(january1.idw_cv, "January 1st Residuals")
-plot_idw_resid(january2.idw_cv, "January 2nd Residuals")
+# plot_idw_resid(january2.idw_cv, "January 2nd Residuals") ERROR -- doesn't work, see above
 
 plot_idw_resid_zscore(pre_fire.idw_cv, "Pre-Fire Residual Z-Scores")
 plot_idw_resid_zscore(during_fire.idw_cv, "During Fire Residual Z-Scores")
 plot_idw_resid_zscore(evening_of_fire.idw_cv, "After Fire Residual Z-Scores")
 plot_idw_resid_zscore(december31.idw_cv, "December 31st Residual Z-Scores")
 plot_idw_resid_zscore(january1.idw_cv, "January 1st Residual Z-Scores")
-plot_idw_resid_zscore(january2.idw_cv, "January 2nd Residual Z-Scores")
+# plot_idw_resid_zscore(january2.idw_cv, "January 2nd Residual Z-Scores") ERROR -- doesn't work, see above
 ```
 
 Trying to plot each map with the residuals next to it, however these just look messy.
@@ -665,7 +983,7 @@ plot_idw_cv(during_fire.idw, "During Fire IDW", during_fire.idw_cv)
 plot_idw_cv(evening_of_fire.idw, "Evening of Fire IDW", evening_of_fire.idw_cv)
 plot_idw_cv(december31.idw, "December 31st IDW", december31.idw_cv)
 plot_idw_cv(january1.idw, "January 1st IDW", january1.idw_cv)
-plot_idw_cv(january2.idw, "January 2nd IDW", january2.idw_cv)
+# plot_idw_cv(january2.idw, "January 2nd IDW", january2.idw_cv) -- ERROR: doesn't work, see above
 ```
 
 
@@ -679,22 +997,24 @@ plot_idw_cv(january2.idw, "January 2nd IDW", january2.idw_cv)
 * Same as prior 2 days
   + Something happened starting on December 31st with these two sensors? Will look into both and see how the values differ over time
 ```{r}
-# One sensor is "Eisenhower Dr"
-plot(fortify(PA_STFDF[PA_STFDF@data$Name == "Eisenhower Dr"]["2021-12-30::2022-01-02", "corrected_pm"]))
-# The other is "Purple House"
-plot(fortify(PA_STFDF[PA_STFDF@data$Name == "Purple House"]["2021-12-30::2022-01-02", "corrected_pm"]), col="red")
+# # One sensor is "Eisenhower Dr"
+# plot(fortify(PA_STFDF[PA_STFDF@data$Name == "Eisenhower Dr"]["2021-12-30::2022-01-02", "corrected_pm"])) -- ERROR: "error in evaluating the argument 'x' in selecting a method for function 'plot': missing value where TRUE/FALSE needed"
+# # The other is "Purple House"
+# plot(fortify(PA_STFDF[PA_STFDF@data$Name == "Purple House"]["2021-12-30::2022-01-02", "corrected_pm"]), col="red") -- ERROR: "error in evaluating the argument 'x' in selecting a method for function 'plot': missing value where TRUE/FALSE needed"
+
 ```
 
 The issue is coming from the Eisenhower Dr sensor most likely, as this is the one that seems messed up by the snow. Going to see how everything looks excluding the high values for this sensor. This fed back into our analysis, and has already been accounted for in the current models.
 
 ```{r}
-plot(fortify(PA_STFDF[PA_STFDF@data$Name == "Eisenhower Dr"]["2021-12-30::2022-01-02", "corrected_pm"]) %>%
-               filter(corrected_pm <= 1000))
+# plot(fortify(PA_STFDF[PA_STFDF@data$Name == "Eisenhower Dr"]["2021-12-30::2022-01-02", "corrected_pm"]) %>%
+#                filter(corrected_pm <= 1000)) -- ERROR: "error in evaluating the argument 'x' in selecting a method for function 'plot': missing value where TRUE/FALSE needed"
 ```
 
 Checking the sensor on the edge of the fire boundary with high residuals/z scores.
 ```{r}
-plot(fortify(PA_STFDF[PA_STFDF@data$Name == "ntsky"]["2021-12-30::2022-01-02", "corrected_pm"]))
+# plot(fortify(PA_STFDF[PA_STFDF@data$Name == "ntsky"]["2021-12-30::2022-01-02", "corrected_pm"])) -- ERROR: "error in evaluating the argument 'x' in selecting a method for function 'plot': missing value where TRUE/FALSE needed"
+
 ```
 
 
@@ -720,74 +1040,29 @@ for (j in c(30, 31, 01, 02)) {
 ```
 
 ```{r, animation.hook='gifski', interval=1.5, results='hide'}
-for (j in c(30, 31, 01, 02)) {
-  if (j > 3) {
-    date <- paste("2021-12-", j, sep="")
-  } else {
-    date <- paste("2022-01-", j, sep="")
-  }
-  for (i in 0:23) {
-    if (i < 10) {
-      i <- paste("0", i, sep="")
-    }
-    t <- paste(date, " ", i, ":00:00", sep="")
-    i.data <- krig_data[, t]
-    i.idw <- idw(corrected_pm~1, i.data[!is.na(i.data$corrected_pm),], grd)
-    i.idw_cv <- krige.cv(corrected_pm~1, i.data[!is.na(i.data$corrected_pm),], nfold=38)
-    i.idw_sd <- sd(i.idw_cv$residual)
-    i.idw_cv$zscore <- i.idw_cv$residual / i.idw_sd
-    print(plot_idw_resid_zscore(i.idw_cv, paste(t, "IDW Residual Z-Scores")))
-  }
-}
+# ERROR: "must have 'max' > 'min'"; note that many of the cv plots did run before the error was thrown
+# for (j in c(30, 31, 01, 02)) {
+#   if (j > 3) {
+#     date <- paste("2021-12-", j, sep="")
+#   } else {
+#     date <- paste("2022-01-", j, sep="")
+#   }
+#   for (i in 0:23) {
+#     if (i < 10) {
+#       i <- paste("0", i, sep="")
+#     }
+#     t <- paste(date, " ", i, ":00:00", sep="")
+#     i.data <- krig_data[, t]
+#     i.idw <- idw(corrected_pm~1, i.data[!is.na(i.data$corrected_pm),], grd)
+#     i.idw_cv <- krige.cv(corrected_pm~1, i.data[!is.na(i.data$corrected_pm),], nfold=38)
+#     i.idw_sd <- sd(i.idw_cv$residual)
+#     i.idw_cv$zscore <- i.idw_cv$residual / i.idw_sd
+#     print(plot_idw_resid_zscore(i.idw_cv, paste(t, "IDW Residual Z-Scores")))
+#   }
+# }
 ```
 
-# Daily Gifs Starting 1/3/2022
-```{r, warning=F}
-# get the full timerange of data & clean it up
-daily <- complete_STFDF[,"2022-01-01::"]
-daily <- daily[daily@data$Location == "outside"]
-# drop sensor 112606 b/c 0% confidence according to PurpleAir
-daily <- daily[daily@data$ID != 112606]
-# drop values for "Eisenhower Dr" sensor that're over 1000
-daily@data[(daily@data$ID == 91877) &
-                 (as.numeric(daily@data$corrected_pm) > 1000) &
-                 !is.na(daily@data$corrected_pm),]$corrected_pm <- NA
-# get rid of the weird sensor that might be throwing residuals off
-daily <- daily[daily@data$Name != "ntsky"]
-# get rid of "ponderosa" sensor values after april 11 (when sensor looks to get wonky)
-daily@data[(daily@data$ID == 102614) & (daily@endTime < "2022-04-11") & !is.na(daily@data)] <- NA
-
-# reproject & aggregate
-daily@sp <- spTransform(daily@sp, reproj)
-daily <- aggregate(daily, by="day", mean)
-```
-
-Outputs for the paper (November 2022)
-```{r}
-# jan 1 - feb 4th inclusive
-for (j in 1:2) {
-  date <- paste("2022-0", j, sep="")
-  if (j == 1) {
-    range = 1:31
-  } else {
-    range = 1:4
-  }
-  
-  for (i in range) {
-    if (i < 10) {
-      i <- paste("0", i, sep="")
-    }
-    day <- paste(date, "-", i, sep="")
-    
-    data <- daily[, day]
-    idw <- idw(corrected_pm~1, data[!is.na(data$corrected_pm),], grd)
-    png(paste("../images/jan1-feb4/", day, ".png", sep=''))
-    print(plot_idw_raster(idw, paste(day, "IDW")))
-    dev.off()
-    }
-}
-```
-
+# gif
 ```{r, animation.hook="gifski", interval=1.5, results='hide'}
 # jan 1 - feb 4th inclusive
 for (j in 1:4) {

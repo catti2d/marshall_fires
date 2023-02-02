@@ -64,6 +64,53 @@ AQ_df = AQ_df %>%
          ab_difference = pm25_a-pm25_b))
 ```
 
+```{r}
+# filter out days with < 70% completeness after cleaning
+AQ_df_valid = AQ_df_valid %>%
+  mutate(date_string = as.Date(format(datetime, "%Y-%m-%d")))
+
+# days with fully complete observations will have 144 as the datetime count; 144= 24 hours in a day * 6 10-minute intervals in an hour
+pct_valid_obs_by_day = AQ_df_valid %>%
+  group_by(ID, date_string) %>%
+  dplyr::summarise(datetime_count = n(),
+            datetime_pct = (datetime_count/ 144) * 100,
+            is_complete = ifelse(datetime_pct > 100, "too many observations -- remove duplicates",
+                                 ifelse(datetime_pct >= 70 & datetime_pct <= 100, "over 70% data -- complete day",
+                                        "incomplete")))
+
+# check for duplicates -- there seem to be quite a few
+pct_valid_obs_by_day %>% filter(is_complete == "too many observations -- remove duplicates")
+
+# remove duplicates -- worked (re_run above code from "pct_valid_obs_by_day" to get new number of duplicates)
+(AQ_df_valid = AQ_df_valid %>% distinct()) #238827
+
+# re-run pct_valid_obs_by_day to make sure that with duplicates removed they still meet the threshold
+(pct_valid_obs_by_day = AQ_df_valid %>%
+  group_by(ID, date_string) %>%
+  summarise(datetime_count = n(),
+            datetime_pct = (datetime_count/ 144) * 100,
+            is_complete = ifelse(datetime_pct > 100, "too many observations -- remove duplicates",
+                                 ifelse(datetime_pct >= 70 & datetime_pct <= 100, "over 70% data -- complete day",
+                                        "incomplete"))))
+
+# confirm no more duplicates -- only incomplete and complete categories remain
+pct_valid_obs_by_day %>% group_by(is_complete) %>% summarise(count = n())
+
+# test merge
+(AQ_df_valid_merge = merge(AQ_df_valid, pct_valid_obs_by_day, by = c("ID","date_string"))) #238827
+
+# filter out incompletes # 232442
+(AQ_df_valid_filtered = AQ_df_valid_merge %>% 
+  filter(! is_complete == "incomplete"))
+
+
+# check that it worked -- numbers for incomplete and complete should add up to former length (238827)
+AQ_df_valid_merge %>% filter(is_complete == "incomplete") # 6385
+AQ_df_valid_merge %>% filter(is_complete == "over 70% data -- complete day") # 232442
+
+```
+
+
 ## Cleaning summary stats
 
 ```{r}
@@ -240,7 +287,7 @@ sum(agree_counts_fire$n_disagree) + sum(agree_counts_fire$n_agree)
 ## Same Analysis, but January
 ```{r}
 agree = AQ_df %>%
-  dplyr::filter(a_b_agree == "agree" & datetime < "2022-02-01") %>%
+  dplyr::filter(a_b_agree == "agree" & (datetime < "2022-02-04") & (datetime > "2022-01-08"))%>%
   group_by(ID, a_b_agree) %>%
   dplyr::summarise(n_agree = n())
 
@@ -262,6 +309,7 @@ agree_counts_jan %>%
 
 ```{r}
 agree_counts_jan = left_join(agree_counts_jan, sensors, by="ID")
+agree_counts_jan
 ```
 
 ```{r}
@@ -377,7 +425,7 @@ AQ_df %>% tbl_cross(row = ID, col = a_b_agree, percent = "row") %>% as_gt()
 
 
 # Correction
-equation found here: https://fire.airnow.gov/#correction-equation
+equation found here: https://fire.airnow.gov/#correction-equation (note this is the June 2021 correction equation)
 
     * Low Concentration
     PAcf_atm < 50 µg/m3 	
@@ -396,7 +444,7 @@ equation found here: https://fire.airnow.gov/#correction-equation
 # linear piecewise correction from the EPA
 ## question about using the pm avg or just the a channel
 ## confirm that this is the best correction
-(corrected_AQ = AQ_df_valid %>% 
+(corrected_AQ = AQ_df_valid_filtered %>% 
    rowwise() %>% 
    mutate(
   corrected_pm = ifelse(pm_avg < 50, ((0.52 * pm_avg) - (0.088 * rh) + 5.75),
